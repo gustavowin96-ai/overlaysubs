@@ -190,8 +190,8 @@ function modelsPage() {
       ${snap.running ? `<p class="muted small">${t("model_restart_note")}</p>` : ""}
       <div class="row">${btn("download", busy.has("download") ? t("downloading") : `${t("download")} (${gb(total)})`, { cls: ready ? "" : "primary", disabled: ready })}</div>`
     : `<p class="muted">${t("step_locked")}</p>`)}
-  ${step(3, !!benchMsg, !ready, t("step_bench"), `<p class="muted">${t("step_bench_desc")}</p>
-    <div class="row">${btn("bench", busy.has("bench") ? t("benchmarking") : t("benchmark"), { disabled: !ready })}${benchMsg ? `<span>${esc(benchMsg)}</span>` : ""}</div>`)}
+  ${s.session.display_mode === "original" ? step(3, !!benchMsg, !ready, t("step_bench"), `<p class="muted">${t("step_bench_desc")}</p>
+    <div class="row">${btn("bench", busy.has("bench") ? t("benchmarking") : t("benchmark"), { disabled: !ready })}${benchMsg ? `<span>${esc(benchMsg)}</span>` : ""}</div>`) : `<p class="muted small">O teste de velocidade original mede Whisper + PLaMo e está disponível no modo Original. English usa apenas Whisper; Português e Bilíngue usam o modelo português.</p>`}
   <details class="card"><summary>${t("advanced")}</summary>
     <div class="f"><span>${t("models_dir")}</span><div class="row"><code>${esc(snap.models_dir)}</code>${btn("dir", t("change"), { cls: "small" })}</div></div>
   </details>`;
@@ -214,10 +214,11 @@ function homePage() {
       ${field("Low Latency", "session.low_latency", "check")}
       <p class="muted small">Português requer o download em Models. Low Latency: parciais a cada 0,8 s; use Whisper Base.</p>`)}
     ${card(t("languages"), `${select(t("src_lang"), "session.source_lang", langOpts(s.session.source_lang, [["", t("auto")]]), "nullable")}
-      ${select(t("tgt_lang"), "session.target_lang", langOpts(s.session.target_lang, [], TARGET_LANGS))}
-      ${select(t("alt_lang"), "session.alt_target_lang", langOpts(s.session.alt_target_lang, [], TARGET_LANGS))}`)}
+      ${s.session.display_mode === "original" ? `${select(t("tgt_lang"), "session.target_lang", langOpts(s.session.target_lang, [], TARGET_LANGS))}
+      ${select(t("alt_lang"), "session.alt_target_lang", langOpts(s.session.alt_target_lang, [], TARGET_LANGS))}` : `<p class="muted small">English exibe a transcrição. Português e Bilíngue traduzem de inglês para português brasileiro; selecione English como idioma falado.</p>`}`)}
   </div>
   <details class="card"><summary>${t("tuning")}</summary>
+    ${s.session.display_mode === "original" ? "" : `<p class="muted small">Formalidade e contexto de tradução se aplicam ao modo Original · PLaMo. Tópico e glossário também orientam o reconhecimento de fala.</p>`}
     ${select(t("form"), "session.form", opts([["", t("form_default")], ["plain", t("plain")], ["polite", t("polite")]], s.session.form), "nullable")}
     ${field(t("context"), "session.use_context", "check")}
     ${field(t("topic"), "session.topic", "text", `placeholder="${esc(t("topic_ph"))}"`)}

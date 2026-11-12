@@ -248,7 +248,8 @@ mod tests {
             std::fs::write(dir.join("jfk.wav"), bytes).unwrap();
         }
         let pcm = wav(dir.join("jfk.wav"));
-        let mut asr = Whisper::load(&path("whisper-base"), &path("silero-vad-v6.2.0"), false, 4).unwrap();
+        let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(6);
+        let mut asr = Whisper::load(&path("whisper-base"), &path("silero-vad-v6.2.0"), false, threads).unwrap();
         let mut profiles = vec![];
         for low in [false, true] {
             asr.low_latency = low;

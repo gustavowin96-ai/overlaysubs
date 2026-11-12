@@ -30,7 +30,7 @@ const ERR_AUDIO: &str = "E_MACOS_AUDIO";
 ///
 /// The stream is created, started, and dropped on its own thread because `SCStream` is not
 /// `Send` everywhere it touches AppKit; the stop flag is polled there.
-pub fn start(tx: Sender<Vec<f32>>) -> Result<Arc<AtomicBool>, String> {
+pub fn start(tx: Sender<super::AudioChunk>) -> Result<Arc<AtomicBool>, String> {
     let stop = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&stop);
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
@@ -58,7 +58,7 @@ pub fn start(tx: Sender<Vec<f32>>) -> Result<Arc<AtomicBool>, String> {
     Ok(stop)
 }
 
-fn open(tx: Sender<Vec<f32>>) -> Result<SCStream, String> {
+fn open(tx: Sender<super::AudioChunk>) -> Result<SCStream, String> {
     // Triggers the Screen Recording prompt on first use and blocks until the user answers.
     let content = SCShareableContent::get().map_err(start_error)?;
     let display = content
@@ -143,13 +143,13 @@ struct AudioSink {
 }
 
 struct SinkState {
-    tx: Sender<Vec<f32>>,
+    tx: Sender<super::AudioChunk>,
     in_rate: usize,
     resampler: Resampler,
 }
 
 impl AudioSink {
-    fn new(tx: Sender<Vec<f32>>) -> Self {
+    fn new(tx: Sender<super::AudioChunk>) -> Self {
         Self {
             state: Mutex::new(SinkState {
                 tx,
@@ -179,7 +179,7 @@ impl SCStreamOutputTrait for AudioSink {
         }
         let chunk = state.resampler.push_mono(&mono);
         if !chunk.is_empty() {
-            let _ = state.tx.send(chunk);
+            let _ = state.tx.send(super::AudioChunk::new(chunk));
         }
     }
 }

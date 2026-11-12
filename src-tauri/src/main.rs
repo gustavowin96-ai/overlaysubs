@@ -15,7 +15,7 @@ use overlaysubs_core::endpoint::{EndpointConfig, Endpointer, Event};
 use overlaysubs_core::browser_source;
 use overlaysubs_core::export::{self, Entry};
 use overlaysubs_core::registry::{Registry, Selection};
-use overlaysubs_core::session::{Asr, Caption, Session, SessionConfig, Translator, DisplayMode, Stage};
+use overlaysubs_core::session::{Caption, Session, SessionConfig, Translator, DisplayMode, Stage};
 use overlaysubs_core::tier::{self, Hardware, Tier};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -167,7 +167,7 @@ const SOURCE_FILES: &[browser_source::File] = &[
 /// Starts, moves or stops the browser source server to match the settings, and sends it the appearance.
 /// Only the overlay's own settings leave the app: the rest (folders, glossary) is not its business.
 fn sync_browser_source(st: &App, s: &Settings) -> Result<(), String> {
-    st.source_hub.set_settings(serde_json::json!({ "overlay": s.overlay, "ui_lang": s.ui_lang }).to_string());
+    st.source_hub.set_settings(serde_json::json!({ "overlay": s.overlay, "ui_lang": s.ui_lang, "session": s.session }).to_string());
     let mut server = st.source_server.lock().unwrap();
     if !s.browser_source {
         *server = None;
@@ -328,6 +328,9 @@ async fn download(app: AppHandle, ids: Vec<String>) -> Result<(), String> {
 
 #[tauri::command]
 fn delete_model(app: AppHandle, st: State<App>, id: String) -> Result<(), String> {
+    if st.running.lock().unwrap().is_some() {
+        return Err("Pare a captura antes de excluir modelos.".into());
+    }
     let s = st.settings.lock().unwrap().clone();
     let m = registry(&app)?.get(&id).cloned().ok_or("unknown model")?;
     let mut eng = st.engines.lock().unwrap();
@@ -480,11 +483,10 @@ fn start(app: AppHandle, st: State<App>) -> Result<(), String> {
     }
     ensure_engines(&app, &st)?;
     let s = st.settings.lock().unwrap().clone();
-    let (audio_tx, audio_rx) = mpsc::channel::<Vec<f32>>();
-    let (ev_tx, ev_rx) = mpsc::sync_channel::<(Event, usize)>(16);
+    let (audio_tx, audio_rx) = mpsc::channel::<capture::AudioChunk>();
+    let (ev_tx, ev_rx) = mpsc::sync_channel::<(Event, usize, u64)>(16);
     let (stop_tx, stop_rx) = mpsc::channel::<()>();
     let mut vad = engine::Silero::load(&st.engines.lock().unwrap().as_ref().unwrap().asr.vad_path)?;
-    let capture_start = unix_ms();
     let cap = capture::start(&s.source, audio_tx)?;
     let vad_app = app.clone();
     // Stream position the session has committed up to, so the endpointer drops that audio.
@@ -496,19 +498,20 @@ fn start(app: AppHandle, st: State<App>) -> Result<(), String> {
         let mut out = Vec::new();
         let mut pos = 0;
         for chunk in audio_rx {
-            pos += chunk.len();
+            pos += chunk.pcm.len();
+            let stream_origin = chunk.captured_end_ms.saturating_sub(pos as u64 * 1000 / 16000);
             let low = endpoint_settings.lock().unwrap().session.low_latency;
             ep.configure(if low { EndpointConfig::low_latency() } else { EndpointConfig::default() });
             ep.commit(committed_ep.load(Ordering::SeqCst));
-            if let Err(err) = ep.push(&chunk, &mut vad, &mut out) {
+            if let Err(err) = ep.push(&chunk.pcm, &mut vad, &mut out) {
                 let _ = vad_app.emit("error", err);
                 return;
             }
             for e in out.drain(..) {
-                match ev_tx.try_send((e, pos)) {
+                match ev_tx.try_send((e, pos, stream_origin)) {
                     Ok(()) => {},
                     Err(mpsc::TrySendError::Disconnected(_)) => return,
-                    Err(mpsc::TrySendError::Full((e, _))) => {
+                    Err(mpsc::TrySendError::Full((e, _, _))) => {
                         if e.is_final() { let _ = vad_app.emit("error", "Reconhecimento sobrecarregado: segmento omitido. Use Whisper Base."); }
                     }
                 }
@@ -526,6 +529,7 @@ fn start(app: AppHandle, st: State<App>) -> Result<(), String> {
     let cancelled = Arc::new(AtomicBool::new(false));
     let worker_app = app.clone();
     let error_app = app.clone();
+    let status_app = app.clone();
     let (pt_tx, pt_thread) = portuguese::spawn(pt_path, cancelled.clone(), move |job| {
         publish_caption(&worker_app, session_id, &job.caption, job.speech_start, job.audio_end);
         let state = worker_app.state::<App>();
@@ -534,14 +538,25 @@ fn start(app: AppHandle, st: State<App>) -> Result<(), String> {
                 entry.translation = job.caption.translation;
             }
         }
-    }, move |err| { if error_app.state::<App>().session_seq.load(Ordering::SeqCst) == session_id { let _ = error_app.emit("error", err); } });
+    }, move |err| { if error_app.state::<App>().session_seq.load(Ordering::SeqCst) == session_id { let _ = error_app.emit("error", err); } },
+    move |status| { if status_app.state::<App>().session_seq.load(Ordering::SeqCst) == session_id { let _ = status_app.emit("translation-status", status); } });
     let session_thread = std::thread::spawn(move || {
         let mut session = Session::new(s.session);
         let mut seen = 0;
 
         loop {
-            let stopping = stop_rx.try_recv().is_ok();
-            let next = if stopping { None } else { ev_rx.recv_timeout(std::time::Duration::from_millis(200)).ok() };
+            let mut stopping = stop_rx.try_recv().is_ok();
+            let next = if stopping { None } else {
+                match ev_rx.recv_timeout(std::time::Duration::from_millis(200)) {
+                    Ok(event) => Some(event),
+                    Err(mpsc::RecvTimeoutError::Timeout) => None,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        stopping = true;
+                        let _ = emit_app.emit("error", "Captura interrompida. Pare e reinicie a captura.");
+                        None
+                    }
+                }
+            };
             let Some(first) = next else {
                 if stopping {
                     cancelled.store(true, Ordering::Relaxed);
@@ -561,14 +576,20 @@ fn start(app: AppHandle, st: State<App>) -> Result<(), String> {
             // Under load, skip stale partials: keep every final and only the newest partial.
             let batch: Vec<_> = std::iter::once(first).chain(ev_rx.try_iter()).collect();
             let n = batch.len();
-            let batch = batch.into_iter().enumerate().filter(|(i, (e, _))| e.is_final() || *i == n - 1).map(|(_, x)| x);
-            for (ev, pos) in batch {
+            let batch = batch.into_iter().enumerate().filter(|(i, (e, _, _))| e.is_final() || *i == n - 1).map(|(_, x)| x);
+            for (ev, pos, stream_origin) in batch {
+                if stop_rx.try_recv().is_ok() {
+                    cancelled.store(true, Ordering::Relaxed);
+                    drop(pt_tx);
+                    let _ = pt_thread.join();
+                    return;
+                }
                 session.tick(pos - seen);
                 seen = pos;
                 let mut g = engines.lock().unwrap();
                 let Some(e) = g.as_mut() else { return };
                 let start = match &ev { Event::Partial { start, .. } | Event::Final { start, .. } => *start };
-                let speech_start = capture_start + (start as u64 * 1000 / 16000);
+                let speech_start = stream_origin + (start as u64 * 1000 / 16000);
                 let audio_end = speech_start + (ev.pcm().len() as u64 * 1000 / 16000);
                 let mode = session.cfg.display_mode;
                 let mut translation_jobs = Vec::new();
@@ -599,11 +620,6 @@ fn start(app: AppHandle, st: State<App>) -> Result<(), String> {
                         let _ = emit_app.emit("error", "Tradutor sobrecarregado: tradução omitida para não atrasar o inglês.");
                     }
                 }
-            }
-            let mut saved = history.lock().unwrap();
-            for (i, entry) in session.entries.iter().enumerate() {
-                if i >= saved.len() { saved.push(entry.clone()); }
-                else if mode_is_original(&session.cfg) { saved[i] = entry.clone(); }
             }
         }
     });

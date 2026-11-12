@@ -242,7 +242,7 @@ listen("caption", (e) => {
   draw();
   if (tauri && shownIds.includes(c.id) && c.speech_start_unix_ms) {
     requestAnimationFrame(() => requestAnimationFrame(() => {
-      if (!shownIds.includes(c.id) || activeSession !== c.session_id) return;
+      if (document.hidden || !shownIds.includes(c.id) || activeSession !== c.session_id || caps.get(c.id)?.emitted_unix_ms !== c.emitted_unix_ms) return;
       const now = Date.now();
       invoke("record_latency", { sessionId: c.session_id, captionId: c.id,
         onsetMs: Math.max(0, now - c.speech_start_unix_ms), tailMs: Math.max(0, now - c.audio_end_unix_ms),

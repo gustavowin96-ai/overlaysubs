@@ -24,6 +24,7 @@ jobs:
         with:
           cache-directories: C:\t
           key: ptbr-cpu-v1
+          cache-on-failure: true
       - name: UI syntax and regression tests
         run: |
           node --check ui/app.js
@@ -44,16 +45,48 @@ jobs:
           (Resolve-Path src-tauri/libs).Path >> $env:GITHUB_PATH
       - name: Application tests
         run: cargo test --release -p overlaysubs
+      - name: Package portable test runtime
+        shell: pwsh
+        run: |
+          $lines = cargo test --release -p overlaysubs --no-run --message-format=json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $test = @($lines | ForEach-Object { $_ | ConvertFrom-Json } | Where-Object { $_.reason -eq 'compiler-artifact' -and $_.profile.test -and $_.executable })
+          if ($test.Count -ne 1) { throw 'Expected exactly one test executable' }
+          New-Item -ItemType Directory -Force test-runtime | Out-Null
+          Copy-Item $test[0].executable test-runtime/overlaysubs-tests.exe
+          Copy-Item src-tauri/libs/*.dll test-runtime/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PTBR-test-runtime
+          path: test-runtime/*
       - name: Real offline models and paced English audio smoke test
-        run: cargo test --release -p overlaysubs ptbr_models_smoke -- --ignored --nocapture --test-threads=1
+        run: ./scripts/smoke-resources.ps1
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: PTBR-test-report
-          path: ptbr-smoke.json
+          path: |
+            ptbr-smoke.json
+            resource-smoke.json
+            smoke-*.log
       - name: Build separate Windows installer
         working-directory: src-tauri
         run: npx --yes @tauri-apps/cli@2.12.4 build --bundles nsis
+      - name: Install into an isolated directory and smoke launch
+        shell: pwsh
+        run: |
+          $installers = @(Get-ChildItem C:\t\release\bundle\nsis\*.exe)
+          if ($installers.Count -ne 1) { throw 'Expected exactly one installer' }
+          $installer = $installers[0]
+          $install = Start-Process -FilePath $installer.FullName -ArgumentList '/S','/D=C:\overlaysubs-ptbr-smoke' -WindowStyle Hidden -Wait -PassThru
+          if ($install.ExitCode -ne 0) { throw "Installer failed: $($install.ExitCode)" }
+          $exe = 'C:\overlaysubs-ptbr-smoke\overlaysubs.exe'
+          if (!(Test-Path $exe)) { throw 'Installed executable missing' }
+          $app = Start-Process -FilePath $exe -WindowStyle Hidden -PassThru
+          Start-Sleep -Seconds 8
+          if ($app.HasExited) { throw "Installed application exited early: $($app.ExitCode)" }
+          Stop-Process -Id $app.Id
+          Get-FileHash $installer.FullName -Algorithm SHA256 | Format-List
       - uses: actions/upload-artifact@v4
         with:
           name: OverlaySubs-PTBR-Windows-x64

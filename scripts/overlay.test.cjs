@@ -36,3 +36,21 @@ test('translation updates replace only matching caption and preserve draft text'
   assert.equal(vm.runInContext('merge({translation:"Olá"},{stage:"streaming",translation:"O"}).translation',c),'Olá');
   assert.equal(vm.runInContext('merge({translation:"Olá"},{stage:"final",translation:"Oi"}).translation',c),'Oi');
 });
+test('caption listener ignores old sessions and prevents a partial overwriting a final', () => {
+  const c=context('bilingual');
+  vm.runInContext(`let activeSession=-1, frozen=null, follow=true, lastUpdate=0;
+    let shownIds=[]; const tauri=null;
+    const callbacks={}; const listen=(name,fn)=>callbacks[name]=fn;
+    const draw=()=>{shownIds=readable().map(c=>c.id)};
+    ${source.slice(source.indexOf('listen("caption"'),source.indexOf('listen("settings"'))}
+    const send=p=>callbacks.caption({payload:p});
+    send({session_id:1,id:0,stage:'final',source:'first',translation:''});
+    send({session_id:1,id:1,stage:'partial',source:'next',translation:''});
+    send({session_id:1,id:0,stage:'final',source:'first',translation:'primeiro'});
+  `,c);
+  assert.equal(vm.runInContext('readable().map(c=>c.source).join(",")',c),'first,next');
+  vm.runInContext(`send({session_id:1,id:0,stage:'partial',source:'stale'});
+    send({session_id:2,id:0,stage:'partial',source:'new session'});
+    send({session_id:1,id:4,stage:'final',source:'old session'});`,c);
+  assert.equal(vm.runInContext('readable().map(c=>c.source).join(",")',c),'new session');
+});

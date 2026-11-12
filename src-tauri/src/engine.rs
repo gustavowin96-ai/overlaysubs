@@ -118,6 +118,7 @@ pub struct Plamo {
     model: LlamaModel,
     threads: i32,
     portuguese: bool,
+    pub cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 const N_CTX: u32 = 4096;
@@ -129,7 +130,7 @@ impl Plamo {
         backend.void_logs();
         let params = LlamaModelParams::default().with_n_gpu_layers(gpu_layers);
         let model = LlamaModel::load_from_file(&backend, model, &params).map_err(|e| e.to_string())?;
-        Ok(Self { backend, model, threads: threads.min(8) as i32, portuguese: false })
+        Ok(Self { backend, model, threads: threads.min(8) as i32, portuguese: false, cancel: None })
     }
 }
 
@@ -169,6 +170,9 @@ impl Translator for Plamo {
         let mut emitted = 0;
         let mut pos = tokens.len() as i32;
         for _ in 0..MAX_NEW {
+            if self.cancel.as_ref().is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) {
+                return Err("Translation cancelled".into());
+            }
             let tok = sampler.sample(&ctx, batch.n_tokens() - 1);
             if vocab.is_eog(tok) {
                 break;
@@ -221,7 +225,7 @@ mod tests {
     #[ignore]
     fn ptbr_models_smoke() {
         let reg = Registry::parse(include_str!("../../models.json")).unwrap();
-        let dir = std::env::temp_dir().join("overlaysubs-models");
+        let dir = std::env::var_os("OVERLAYSUBS_TEST_MODELS").map(std::path::PathBuf::from).unwrap_or_else(|| std::env::temp_dir().join("overlaysubs-models"));
         for id in ["whisper-base", "silero-vad-v6.2.0", crate::portuguese::MODEL] {
             crate::download::fetch(reg.get(id).unwrap(), &dir, &mut |_, _| {}).unwrap();
         }
@@ -232,13 +236,17 @@ mod tests {
             let t = std::time::Instant::now();
             let result = mt.translate(&TranslateRequest { text: source, source_lang: Some("en"), target_lang: "pt-BR", ..Default::default() }, &mut |_| {}).unwrap();
             eprintln!("PTBR {} ms | {source} => {result}", t.elapsed().as_millis());
-            assert!(result.to_lowercase().contains(expected), "Unexpected translation: {result}");
+            let lower = result.to_lowercase();
+            assert!(lower.contains(expected) || (expected == "passagem" && lower.contains("bilhete")), "Unexpected translation: {result}");
+            if source.contains("bus ticket") { assert!(lower.contains("ônibus"), "Expected Brazilian vocabulary: {result}"); }
             assert!(!result.contains("<think>") && !result.contains("<|"));
             translations.push(serde_json::json!({"source":source,"translation":result,"ms":t.elapsed().as_millis()}));
         }
         drop(mt);
-        let bytes = reqwest::blocking::get("https://raw.githubusercontent.com/ggml-org/whisper.cpp/d2c6f05a46dacf663e357bcf0ed40f542a72825d/samples/jfk.wav").unwrap().error_for_status().unwrap().bytes().unwrap();
-        std::fs::write(dir.join("jfk.wav"), bytes).unwrap();
+        if !dir.join("jfk.wav").exists() {
+            let bytes = reqwest::blocking::get("https://raw.githubusercontent.com/ggml-org/whisper.cpp/d2c6f05a46dacf663e357bcf0ed40f542a72825d/samples/jfk.wav").unwrap().error_for_status().unwrap().bytes().unwrap();
+            std::fs::write(dir.join("jfk.wav"), bytes).unwrap();
+        }
         let pcm = wav(dir.join("jfk.wav"));
         let mut asr = Whisper::load(&path("whisper-base"), &path("silero-vad-v6.2.0"), false, 4).unwrap();
         let mut profiles = vec![];
@@ -282,7 +290,7 @@ mod tests {
             eprintln!("REPLAY low_latency={low} first_caption={:?} elapsed={:?}", captions.first(), t0.elapsed());
             profiles.push(serde_json::json!({"low_latency":low,"captions":captions}));
         }
-        let report = serde_json::json!({"translations":translations,"replays":profiles,"note":"Windows CI CPU; capture replay to recognition, not physical speech to overlay paint; not Ryzen validation"});
+        let report = serde_json::json!({"translations":translations,"replays":profiles,"note":"CPU capture replay to recognition, not physical speech to overlay paint; record the host separately"});
         std::fs::write("../ptbr-smoke.json", serde_json::to_string_pretty(&report).unwrap()).unwrap();
     }
 

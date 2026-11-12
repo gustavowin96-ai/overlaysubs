@@ -3508,3 +3508,11 @@ OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
 SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
+# Portuguese development model
+
+The optional Qwen3-1.7B model is by the Qwen team, Apache License 2.0.
+Q4_K_M quantization is distributed by Unsloth. Weights are downloaded separately,
+not included in the installer. Sources and license:
+https://huggingface.co/Qwen/Qwen3-1.7B-GGUF
+https://huggingface.co/unsloth/Qwen3-1.7B-GGUF
+

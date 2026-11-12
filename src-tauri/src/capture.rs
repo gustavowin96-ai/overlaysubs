@@ -44,6 +44,15 @@ fn find(mut it: impl Iterator<Item = cpal::Device>, want: &str) -> Option<cpal::
     it.find(|d| name(d).is_some_and(|n| n == want))
 }
 
+/// Timestamp at the capture callback, before queuing or inference (system clock, milliseconds).
+pub struct AudioChunk {
+    pub pcm: Vec<f32>,
+    pub captured_end_ms: u64,
+}
+impl AudioChunk {
+    pub fn new(pcm: Vec<f32>) -> Self { Self { pcm, captured_end_ms: crate::unix_ms() } }
+}
+
 pub struct Capture {
     stop: Arc<AtomicBool>,
 }
@@ -54,7 +63,7 @@ impl Drop for Capture {
     }
 }
 
-pub fn start(src: &Source, tx: Sender<Vec<f32>>) -> Result<Capture, String> {
+pub fn start(src: &Source, tx: Sender<AudioChunk>) -> Result<Capture, String> {
     #[cfg(target_os = "macos")]
     if let Source::System { .. } = src {
         return sck::start(tx).map(|stop| Capture { stop });
@@ -62,7 +71,7 @@ pub fn start(src: &Source, tx: Sender<Vec<f32>>) -> Result<Capture, String> {
     start_cpal(src, tx)
 }
 
-fn start_cpal(src: &Source, tx: Sender<Vec<f32>>) -> Result<Capture, String> {
+fn start_cpal(src: &Source, tx: Sender<AudioChunk>) -> Result<Capture, String> {
     let h = cpal::default_host();
     let (device, config) = match src {
         Source::System { device } => {
@@ -98,12 +107,12 @@ fn start_cpal(src: &Source, tx: Sender<Vec<f32>>) -> Result<Capture, String> {
         let err = |e| eprintln!("capture error: {e}");
         let cfg = config.config();
         let stream = match config.sample_format() {
-            cpal::SampleFormat::F32 => device.build_input_stream(cfg, move |d: &[f32], _: &_| { let _ = tx.send(rs.push(d, channels)); }, err, None),
+            cpal::SampleFormat::F32 => device.build_input_stream(cfg, move |d: &[f32], _: &_| { let _ = tx.send(AudioChunk::new(rs.push(d, channels))); }, err, None),
             cpal::SampleFormat::I16 => device.build_input_stream(
                 cfg,
                 move |d: &[i16], _: &_| {
                     let f: Vec<f32> = d.iter().map(|s| *s as f32 / 32768.0).collect();
-                    let _ = tx.send(rs.push(&f, channels));
+                    let _ = tx.send(AudioChunk::new(rs.push(&f, channels)));
                 },
                 err,
                 None,
@@ -113,7 +122,7 @@ fn start_cpal(src: &Source, tx: Sender<Vec<f32>>) -> Result<Capture, String> {
                 cfg,
                 move |d: &[i32], _: &_| {
                     let f: Vec<f32> = d.iter().map(|s| *s as f32 / 2147483648.0).collect();
-                    let _ = tx.send(rs.push(&f, channels));
+                    let _ = tx.send(AudioChunk::new(rs.push(&f, channels)));
                 },
                 err,
                 None,

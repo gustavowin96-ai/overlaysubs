@@ -561,6 +561,7 @@ listen("download", (e) => {
   if (pct) pct.textContent = `${Math.floor((100 * p.done) / p.total)}%`;
 });
 listen("running", refresh);
+listen("translation-status", (e) => toast(e.payload));
 listen("overlay-visible", (e) => {
   if (!snap) return;
   snap.overlay_visible = e.payload;

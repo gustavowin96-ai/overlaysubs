@@ -140,6 +140,29 @@ impl Endpointer {
 mod tests {
     use super::*;
 
+    #[test]
+    fn low_latency_emits_by_896_ms_and_closes_after_320_ms_silence() {
+        let mut e = Endpointer::new(EndpointConfig::low_latency());
+        let mut events = vec![];
+        for _ in 0..7 { e.push(&[0.1; 4 * FRAME], &mut Energy(0.01), &mut events).unwrap(); }
+        assert!(matches!(events.first(), Some(Event::Partial { .. })));
+        e.push(&[0.0; 12 * FRAME], &mut Energy(0.01), &mut events).unwrap();
+        assert_eq!(events.iter().filter(|e| e.is_final()).count(), 1);
+    }
+
+    #[test]
+    fn low_latency_bounds_continuous_speech_and_live_changes_keep_audio() {
+        let mut e = Endpointer::new(EndpointConfig::default());
+        let mut events = vec![];
+        e.push(&vec![0.1; RATE], &mut Energy(0.01), &mut events).unwrap();
+        e.configure(EndpointConfig::low_latency());
+        e.push(&vec![0.1; RATE * 8], &mut Energy(0.01), &mut events).unwrap();
+        let finals: Vec<_> = events.iter().filter(|e| e.is_final()).collect();
+        assert_eq!(finals.len(), 2);
+        assert!(finals.iter().all(|e| e.pcm().len() <= RATE * 4 + FRAME));
+        assert!(matches!(finals[0], Event::Final { start: 0, .. }));
+    }
+
     const NO_PRE: EndpointConfig = EndpointConfig { threshold: 0.5, silence_ms: 600, partial_every_ms: 1000, max_ms: 15_000, pre_roll_ms: 0 };
 
     /// Replays fixed probabilities, one per frame.

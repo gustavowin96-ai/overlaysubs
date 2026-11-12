@@ -463,7 +463,7 @@ async function act(name, id, el) {
   }
   if (name === "download") {
     const s = snap.settings.selection;
-    await invoke("download", { ids: [s.vad, s.asr, s.translator].filter((id) => !snap.downloaded.includes(id)) });
+    await invoke("download", { ids: setupState().missing });
     progress = {};
     toast(t("download_done"));
   }

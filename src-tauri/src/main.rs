@@ -571,13 +571,12 @@ fn start(app: AppHandle, st: State<App>) -> Result<(), String> {
                 let speech_start = capture_start + (start as u64 * 1000 / 16000);
                 let audio_end = speech_start + (ev.pcm().len() as u64 * 1000 / 16000);
                 let mode = session.cfg.display_mode;
+                let mut translation_jobs = Vec::new();
                 let mut emit = |c: Caption| {
                     publish_caption(&emit_app, session_id, &c, speech_start, audio_end);
                     // Translate finalized sentences only: repeated drafts consume CPU and revise translations.
                     if c.stage == Stage::Final && matches!(mode, DisplayMode::Portuguese | DisplayMode::Bilingual) {
-                        if pt_tx.try_send(portuguese::Job { caption: c, speech_start, audio_end }).is_err() {
-                            let _ = emit_app.emit("error", "Tradutor sobrecarregado: tradução omitida para não atrasar o inglês.");
-                        }
+                        translation_jobs.push(portuguese::Job { caption: c, speech_start, audio_end });
                     }
                 };
                 e.asr.low_latency = session.cfg.low_latency;
@@ -587,6 +586,19 @@ fn start(app: AppHandle, st: State<App>) -> Result<(), String> {
                     let _ = emit_app.emit("error", err);
                 }
                 committed.store(session.committed(), Ordering::SeqCst);
+                // Install history before dispatch, including when a fast translation completes immediately.
+                {
+                    let mut saved = history.lock().unwrap();
+                    for (i, entry) in session.entries.iter().enumerate() {
+                        if i >= saved.len() { saved.push(entry.clone()); }
+                        else if mode_is_original(&session.cfg) { saved[i] = entry.clone(); }
+                    }
+                }
+                for job in translation_jobs {
+                    if pt_tx.try_send(job).is_err() {
+                        let _ = emit_app.emit("error", "Tradutor sobrecarregado: tradução omitida para não atrasar o inglês.");
+                    }
+                }
             }
             let mut saved = history.lock().unwrap();
             for (i, entry) in session.entries.iter().enumerate() {

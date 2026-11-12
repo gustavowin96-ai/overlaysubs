@@ -14,6 +14,7 @@ jobs:
       GGML_NATIVE: 'OFF'
       CMAKE_DISABLE_FIND_PACKAGE_OpenSSL: 'ON'
     steps:
+      - run: git config --global core.longpaths true
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-node@v4
@@ -43,6 +44,13 @@ jobs:
           (Resolve-Path src-tauri/libs).Path >> $env:GITHUB_PATH
       - name: Application tests
         run: cargo test --release -p overlaysubs
+      - name: Real offline models and paced English audio smoke test
+        run: cargo test --release -p overlaysubs ptbr_models_smoke -- --ignored --nocapture --test-threads=1
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: PTBR-test-report
+          path: ptbr-smoke.json
       - name: Build separate Windows installer
         working-directory: src-tauri
         run: npx --yes @tauri-apps/cli@2.12.4 build --bundles nsis

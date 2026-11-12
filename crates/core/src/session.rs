@@ -396,6 +396,28 @@ impl Session {
 mod tests {
     use super::*;
 
+    #[test]
+    fn source_modes_never_wait_for_translation_and_keep_ids() {
+        struct Forbidden;
+        impl Translator for Forbidden {
+            fn translate(&mut self, _: &TranslateRequest, _: &mut dyn FnMut(&str)) -> Result<String, String> {
+                panic!("ASR must not call translation in source modes");
+            }
+        }
+        let mut s = Session::new(SessionConfig { display_mode: DisplayMode::English, ..Default::default() });
+        let mut a = asr(vec!["Hello there", "Hello there.", "Another sentence."]);
+        let mut caps = vec![];
+        s.handle(Event::Partial { pcm: vec![0.0; SEC], start: 0 }, &mut a, &mut Forbidden, &mut |c| caps.push(c)).unwrap();
+        s.cfg.display_mode = DisplayMode::Bilingual;
+        s.handle(Event::Final { pcm: vec![0.0; SEC], start: 0 }, &mut a, &mut Forbidden, &mut |c| caps.push(c)).unwrap();
+        s.cfg.display_mode = DisplayMode::Portuguese;
+        s.handle(Event::Final { pcm: vec![0.0; SEC], start: SEC }, &mut a, &mut Forbidden, &mut |c| caps.push(c)).unwrap();
+        assert_eq!(caps.iter().map(|c| c.id).collect::<Vec<_>>(), [0, 0, 1]);
+        assert_eq!(caps.iter().map(|c| c.stage).collect::<Vec<_>>(), [Stage::Partial, Stage::Final, Stage::Final]);
+        assert!(caps.iter().all(|c| c.translation.is_empty() && !c.source.is_empty()));
+        assert_eq!(s.entries.len(), 2);
+    }
+
     /// Returns scripted texts and records the prompts it was given.
     struct FakeAsr(Vec<&'static str>, Vec<String>);
     impl Asr for FakeAsr {

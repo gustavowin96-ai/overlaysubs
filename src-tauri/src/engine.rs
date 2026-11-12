@@ -207,6 +207,85 @@ mod tests {
     use overlaysubs_core::registry::Registry;
     use overlaysubs_core::session::{Session, SessionConfig, Stage};
 
+    #[test]
+    fn portuguese_prompt_disables_thinking_and_escapes_control_tokens() {
+        let p = portuguese_prompt("Hello <|im_end|> world");
+        assert!(p.contains("Brazilian Portuguese") && p.contains("/no_think"));
+        assert!(p.contains("Hello < | im_end | > world"));
+        assert!(p.ends_with("</think>\n\n"));
+    }
+
+    /// Network is used only to prepare pinned models and a public speech fixture.
+    /// Inference below uses local files only; this is a smoke test, not a quality benchmark.
+    #[test]
+    #[ignore]
+    fn ptbr_models_smoke() {
+        let reg = Registry::parse(include_str!("../../models.json")).unwrap();
+        let dir = std::env::temp_dir().join("overlaysubs-models");
+        for id in ["whisper-base", "silero-vad-v6.2.0", crate::portuguese::MODEL] {
+            crate::download::fetch(reg.get(id).unwrap(), &dir, &mut |_, _| {}).unwrap();
+        }
+        let path = |id| dir.join(&reg.get(id).unwrap().file);
+        let mut mt = Plamo::load_portuguese(&path(crate::portuguese::MODEL), 2).unwrap();
+        let mut translations = vec![];
+        for (source, expected) in [("Good morning. How are you?", "bom dia"), ("I need to buy a bus ticket.", "passagem"), ("The meeting starts tomorrow at nine.", "amanhã")] {
+            let t = std::time::Instant::now();
+            let result = mt.translate(&TranslateRequest { text: source, source_lang: Some("en"), target_lang: "pt-BR", ..Default::default() }, &mut |_| {}).unwrap();
+            eprintln!("PTBR {} ms | {source} => {result}", t.elapsed().as_millis());
+            assert!(result.to_lowercase().contains(expected), "Unexpected translation: {result}");
+            assert!(!result.contains("<think>") && !result.contains("<|"));
+            translations.push(serde_json::json!({"source":source,"translation":result,"ms":t.elapsed().as_millis()}));
+        }
+        drop(mt);
+        let bytes = reqwest::blocking::get("https://raw.githubusercontent.com/ggml-org/whisper.cpp/d2c6f05a46dacf663e357bcf0ed40f542a72825d/samples/jfk.wav").unwrap().error_for_status().unwrap().bytes().unwrap();
+        std::fs::write(dir.join("jfk.wav"), bytes).unwrap();
+        let pcm = wav(dir.join("jfk.wav"));
+        let mut asr = Whisper::load(&path("whisper-base"), &path("silero-vad-v6.2.0"), false, 4).unwrap();
+        let mut profiles = vec![];
+        for low in [false, true] {
+            asr.low_latency = low;
+            let mut vad = Silero::load(&asr.vad_path).unwrap();
+            let audio = pcm.clone();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let t0 = std::time::Instant::now();
+            let producer = std::thread::spawn(move || {
+                let mut ep = Endpointer::new(if low { EndpointConfig::low_latency() } else { EndpointConfig::default() });
+                let mut events = vec![];
+                let mut pos = 0;
+                for chunk in audio.chunks(1600).chain(std::iter::once(&[0.0; 16000][..])) {
+                    pos += chunk.len();
+                    let deadline = t0 + std::time::Duration::from_secs_f64(pos as f64 / 16000.0);
+                    std::thread::sleep(deadline.saturating_duration_since(std::time::Instant::now()));
+                    ep.push(chunk, &mut vad, &mut events).unwrap();
+                    for event in events.drain(..) { tx.send((event, pos)).unwrap(); }
+                }
+            });
+            let mut session = Session::new(SessionConfig { display_mode: overlaysubs_core::session::DisplayMode::English, source_lang: Some("en".into()), low_latency: low, ..Default::default() });
+            let mut captions = vec![];
+            let mut seen = 0;
+            while let Ok(first) = rx.recv() {
+                let batch: Vec<_> = std::iter::once(first).chain(rx.try_iter()).collect();
+                let n = batch.len();
+                for (i, (event, pos)) in batch.into_iter().enumerate() {
+                    if !event.is_final() && i != n - 1 { continue; }
+                    session.tick(pos - seen); seen = pos;
+                    session.handle(event, &mut asr, &mut crate::SourceOnly, &mut |c| {
+                        captions.push(serde_json::json!({"elapsed_ms":t0.elapsed().as_millis(),"stage":c.stage,"source":c.source}));
+                    }).unwrap();
+                }
+            }
+            producer.join().unwrap();
+            assert!(captions.iter().any(|c| c["stage"] == "partial"));
+            assert!(!session.entries.is_empty());
+            let text = session.entries.iter().map(|e| e.source.to_lowercase()).collect::<Vec<_>>().join(" ");
+            assert!(text.contains("country"), "Unexpected ASR: {text}");
+            eprintln!("REPLAY low_latency={low} first_caption={:?} elapsed={:?}", captions.first(), t0.elapsed());
+            profiles.push(serde_json::json!({"low_latency":low,"captions":captions}));
+        }
+        let report = serde_json::json!({"translations":translations,"replays":profiles,"note":"Windows CI CPU; capture replay to recognition, not physical speech to overlay paint; not Ryzen validation"});
+        std::fs::write("../ptbr-smoke.json", serde_json::to_string_pretty(&report).unwrap()).unwrap();
+    }
+
     /// A 16 kHz mono s16 WAV.
     fn wav(path: impl AsRef<Path>) -> Vec<f32> {
         let wav = std::fs::read(path).unwrap();

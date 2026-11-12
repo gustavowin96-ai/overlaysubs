@@ -33,9 +33,21 @@ pub trait Translator: Send {
     fn translate(&mut self, req: &TranslateRequest, on_piece: &mut dyn FnMut(&str)) -> Result<String, String>;
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DisplayMode {
+    #[default]
+    Original,
+    English,
+    Portuguese,
+    Bilingual,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SessionConfig {
+    pub display_mode: DisplayMode,
+    pub low_latency: bool,
     pub source_lang: Option<String>,
     #[serde(deserialize_with = "target_code")]
     pub target_lang: String,
@@ -57,7 +69,7 @@ fn target_code<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Erro
 
 impl Default for SessionConfig {
     fn default() -> Self {
-        Self { source_lang: None, target_lang: "en".into(), alt_target_lang: "ja".into(), form: None, use_context: true, glossary: vec![], topic: String::new() }
+        Self { display_mode: DisplayMode::Original, low_latency: false, source_lang: None, target_lang: "en".into(), alt_target_lang: "ja".into(), form: None, use_context: true, glossary: vec![], topic: String::new() }
     }
 }
 
@@ -313,6 +325,10 @@ impl Session {
         if !has_words(&text) {
             return Ok(());
         }
+        if self.cfg.display_mode != DisplayMode::Original {
+            emit(Caption { id: self.next_id, stage: Stage::Partial, lang: t.lang, source: text, translation: String::new() });
+            return Ok(());
+        }
         let translation = self.translate(&text, &t.lang, mt, &mut |_| {})?;
         if has_words(&translation) {
             emit(Caption { id: self.next_id, stage: Stage::Partial, lang: t.lang, source: text, translation });
@@ -357,10 +373,12 @@ impl Session {
             let to = start_ms + span * done as u64 / total as u64;
             let mut cap = Caption { id: self.next_id, stage: Stage::Streaming, lang: lang.clone(), source, translation: String::new() };
             let mut acc = String::new();
+            if self.cfg.display_mode == DisplayMode::Original {
             cap.translation = self.translate(&cap.source, &cap.lang, mt, &mut |piece| {
                 acc.push_str(piece);
                 emit(Caption { translation: acc.clone(), ..cap.clone() });
             })?;
+            }
             cap.stage = Stage::Final;
             emit(cap.clone());
             self.next_id += 1;

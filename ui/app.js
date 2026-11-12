@@ -47,7 +47,7 @@ async function refresh() {
     try { await invoke("save_settings", { settings: snap.settings }); }
     catch (e) { toast(errText(e), "error"); }
   }
-  if (snap.terms_accepted) checkUpdate();
+  // Fork builds are distributed as tested development artifacts.
   render();
 }
 
@@ -109,7 +109,10 @@ const card = (title, body, extra = "") => `<div class="card" ${extra}>${title ? 
 // --- setup state ---
 function setupState() {
   const sel = snap.settings.selection;
-  const missing = sel ? [sel.vad, sel.asr, sel.translator].filter((id) => !snap.downloaded.includes(id)) : [];
+  const ids = sel ? [sel.vad, sel.asr] : [];
+  if (sel && snap.settings.session.display_mode === "original") ids.push(sel.translator);
+  if (["portuguese", "bilingual"].includes(snap.settings.session.display_mode)) ids.push("qwen3-1.7b-ptbr-q4_k_m");
+  const missing = ids.filter((id) => !snap.downloaded.includes(id));
   return { sel, missing, ready: !!sel && missing.length === 0 };
 }
 
@@ -149,7 +152,7 @@ function deviceRow(kind, key) {
 
 function modelRow(kind, key) {
   const s = snap.settings.selection;
-  const list = snap.registry.models.filter((m) => m.kind === kind);
+  const list = snap.registry.models.filter((m) => m.kind === kind && m.id !== "qwen3-1.7b-ptbr-q4_k_m");
   const cur = model(s[key]);
   const have = snap.downloaded.includes(cur.id);
   const p = progress[cur.id];
@@ -181,6 +184,8 @@ function modelsPage() {
   ${step(2, ready, !sel, t("step_download"), sel
     ? `<p class="muted">${t("step_download_desc")}</p>
       ${modelRow("asr", "asr")}${modelRow("translator", "translator")}${modelRow("vad", "vad")}
+      <div class="mrow"><strong>Português (Brasil) · Qwen3 1.7B Q4_K_M · 1.11 GB</strong>
+      <div class="mstatus" data-mstatus="qwen3-1.7b-ptbr-q4_k_m">${snap.downloaded.includes("qwen3-1.7b-ptbr-q4_k_m") ? "✓ Downloaded" : btn("download-pt", "Baixar modelo português")} </div></div>
       ${snap.gpu_build ? "" : `<p class="muted small">${t("gpu_build_cpu")}</p>`}
       ${snap.running ? `<p class="muted small">${t("model_restart_note")}</p>` : ""}
       <div class="row">${btn("download", busy.has("download") ? t("downloading") : `${t("download")} (${gb(total)})`, { cls: ready ? "" : "primary", disabled: ready })}</div>`
@@ -205,6 +210,9 @@ function homePage() {
     ${card(t("input"), `${select(t("source"), "source.kind", opts([["system", t("system")], ["mic", t("mic")]], s.source.kind))}
       ${macSystem ? `<p class="muted small">${t("system_audio_note")}</p>` : select(t("device"), "source.device", opts([["", t("default_dev")], ...devs.map((d) => [d, d])], s.source.device), "nullable")}
       ${snap.running ? `<p class="muted small">${t("input_restart_note")}</p>` : ""}`)}
+    ${card("Legendas", `${select("Exibição", "session.display_mode", opts([["english", "English"], ["portuguese", "Português (Brasil)"], ["bilingual", "Bilíngue"], ["original", "Original · PLaMo"]], s.session.display_mode))}
+      ${field("Low Latency", "session.low_latency", "check")}
+      <p class="muted small">Português requer o download em Models. Low Latency: parciais a cada 0,8 s; use Whisper Base.</p>`)}
     ${card(t("languages"), `${select(t("src_lang"), "session.source_lang", langOpts(s.session.source_lang, [["", t("auto")]]), "nullable")}
       ${select(t("tgt_lang"), "session.target_lang", langOpts(s.session.target_lang, [], TARGET_LANGS))}
       ${select(t("alt_lang"), "session.alt_target_lang", langOpts(s.session.alt_target_lang, [], TARGET_LANGS))}`)}
@@ -435,6 +443,10 @@ document.addEventListener("change", (ev) => {
 });
 
 async function act(name, id, el) {
+  if (name === "download-pt") {
+    await invoke("download", { ids: ["qwen3-1.7b-ptbr-q4_k_m"] });
+    return refresh();
+  }
   if (name === "nav") { page = id; return render(); }
   if (name === "goto-models") { page = "models"; return render(); }
   if (name === "terms-ja" || name === "terms-en") { termsLang = name.slice(6); return render(); }

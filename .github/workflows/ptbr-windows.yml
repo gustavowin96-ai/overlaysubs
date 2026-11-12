@@ -1,0 +1,53 @@
+name: PT-BR Windows development
+on:
+  push:
+    branches: [dev/low-latency-pt-br]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      CARGO_TARGET_DIR: C:\t
+      GGML_NATIVE: 'OFF'
+      CMAKE_DISABLE_FIND_PACKAGE_OpenSSL: 'ON'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-directories: C:\t
+          key: ptbr-cpu-v1
+      - name: UI syntax and regression tests
+        run: |
+          node --check ui/app.js
+          node --check ui/overlay.js
+          node --test scripts/overlay.test.cjs
+      - name: Core tests
+        run: cargo test -p overlaysubs-core
+      - name: Build CPU application and stage DLLs
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force src-tauri/libs | Out-Null
+          New-Item -ItemType File -Force src-tauri/libs/placeholder.dll | Out-Null
+          cargo build --release -p overlaysubs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Remove-Item -LiteralPath src-tauri/libs/placeholder.dll
+          Copy-Item C:\t\release\build\llama-cpp-sys-2-*\out\bin\*.dll src-tauri/libs/
+          if (!(Test-Path src-tauri/libs/llama.dll)) { throw 'llama.dll missing' }
+          (Resolve-Path src-tauri/libs).Path >> $env:GITHUB_PATH
+      - name: Application tests
+        run: cargo test --release -p overlaysubs
+      - name: Build separate Windows installer
+        working-directory: src-tauri
+        run: npx --yes @tauri-apps/cli@2.12.4 build --bundles nsis
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OverlaySubs-PTBR-Windows-x64
+          path: C:\t\release\bundle\nsis\*.exe
+          if-no-files-found: error

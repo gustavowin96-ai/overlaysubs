@@ -32,6 +32,12 @@ pub struct EndpointConfig {
     pub pre_roll_ms: usize,
 }
 
+impl EndpointConfig {
+    pub fn low_latency() -> Self {
+        Self { silence_ms: 320, partial_every_ms: 800, max_ms: 4000, ..Self::default() }
+    }
+}
+
 impl Default for EndpointConfig {
     fn default() -> Self {
         Self { threshold: 0.5, silence_ms: 600, partial_every_ms: 1000, max_ms: 15_000, pre_roll_ms: 200 }
@@ -76,6 +82,10 @@ impl Endpointer {
 
     /// The session committed everything before stream position `pos`: drop that audio from the running
     /// utterance, so later partials and `max_ms` only count what is still open.
+    pub fn configure(&mut self, cfg: EndpointConfig) {
+        self.cfg = cfg;
+    }
+
     pub fn commit(&mut self, pos: usize) {
         if self.buf.is_empty() || pos <= self.start {
             return;

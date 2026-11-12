@@ -8,6 +8,7 @@ document.body.classList.toggle("source", !tauri);
 
 let cfg = overlayConfig();
 let uiLang = "en";
+let displayMode = "original", activeSession = -1;
 // Set while the appearance settings are open, so changes can be checked with translation stopped.
 let preview = false;
 const caps = new Map(); // id -> caption
@@ -51,6 +52,7 @@ function apply(settings) {
   // being read before the styles change and put it back afterwards.
   const anchor = follow ? null : visibleAnchor();
   cfg = overlayConfig(settings.overlay);
+  displayMode = settings.session?.display_mode || "original";
   uiLang = settings.ui_lang || detectUiLang(navigator.languages);
   document.documentElement.lang = uiLang || "en";
   showGrip();
@@ -74,8 +76,13 @@ function apply(settings) {
   restoreAnchor(anchor);
 }
 
-const captionHtml = (c) =>
-  `<div class="cap ${c.stage}"${c.id == null ? "" : ` data-id="${c.id}"`}>${cfg.showSource ? `<span class="src">${esc(c.source)}</span>` : ""}<span class="tr">${esc(c.translation)}</span></div>`;
+const captionHtml = (c) => {
+  const source = displayMode === "english" ? `<span class="tr">${esc(c.source)}</span>` :
+    (displayMode === "bilingual" || (displayMode === "original" && cfg.showSource)) ? `<span class="src">${esc(c.source)}</span>` : "";
+  const translated = displayMode === "english" ? "" : `<span class="tr">${esc(c.translation)}</span>`;
+  return `<div class="cap ${c.stage}"${c.id == null ? "" : ` data-id="${c.id}"`}>${source}${translated}</div>`;
+};
+const isReadable = (c) => hasWords(["english", "bilingual"].includes(displayMode) ? c.source : c.translation);
 
 /** Two sample captions so the "lines" setting is previewed too (real captions take priority). */
 function previewHtml() {
@@ -87,7 +94,7 @@ function previewHtml() {
 }
 
 /** Captions with a readable translation, in arrival order. */
-const readable = () => [...caps.values()].filter((c) => hasWords(c.translation));
+const readable = () => [...caps.values()].sort((a,b) => a.id - b.id).filter(isReadable);
 
 function draw() {
   const now = Date.now();
@@ -109,7 +116,7 @@ function draw() {
 
   const entries = readable();
   const shown = frozen
-    ? frozen.map((id) => caps.get(id)).filter((c) => c && hasWords(c.translation))
+    ? frozen.map((id) => caps.get(id)).filter((c) => c && isReadable(c))
     : entries.slice(-cfg.lines);
   const html = shown.length ? shown.map((c) => captionHtml(c)).join("") : preview ? previewHtml() : "";
   if (html !== lastHtml) {
@@ -223,9 +230,25 @@ function merge(prev, next) {
 }
 
 listen("caption", (e) => {
+  const c = e.payload;
+  if (c.session_id != null && c.session_id < activeSession) return;
+  if (c.session_id != null && c.session_id !== activeSession) {
+    activeSession = c.session_id; caps.clear(); frozen = null; follow = true;
+  }
+  // A late translation updates only its own finalized sentence, never a newer draft.
+  if (caps.get(c.id)?.stage === "final" && c.stage === "partial") return;
   lastUpdate = Date.now();
-  caps.set(e.payload.id, merge(caps.get(e.payload.id), e.payload));
+  caps.set(c.id, merge(caps.get(c.id), c));
   draw();
+  if (tauri && shownIds.includes(c.id) && c.speech_start_unix_ms) {
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      if (!shownIds.includes(c.id) || activeSession !== c.session_id) return;
+      const now = Date.now();
+      invoke("record_latency", { sessionId: c.session_id, captionId: c.id,
+        onsetMs: Math.max(0, now - c.speech_start_unix_ms), tailMs: Math.max(0, now - c.audio_end_unix_ms),
+        renderMs: Math.max(0, now - c.emitted_unix_ms), translated: hasWords(c.translation) }).catch(() => {});
+    }));
+  }
 });
 listen("settings", (e) => apply(e.payload));
 // Hidden windows have their timers throttled, so drop captions as the overlay disappears

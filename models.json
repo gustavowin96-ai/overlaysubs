@@ -124,6 +124,16 @@
       "size": 885098,
       "sha256": "2aa269b785eeb53a82983a20501ddf7c1d9c48e33ab63a41391ac6c9f7fb6987",
       "default_for": []
+    },
+    {
+      "id": "qwen3-1.7b-ptbr-q4_k_m",
+      "kind": "translator",
+      "label": "Português (Brasil) · Qwen3 1.7B Q4_K_M",
+      "url": "https://huggingface.co/unsloth/Qwen3-1.7B-GGUF/resolve/d7f544eead698dbd1f15126ef60b45a1e1933222/Qwen3-1.7B-Q4_K_M.gguf",
+      "file": "Qwen3-1.7B-Q4_K_M.gguf",
+      "size": 1107409472,
+      "sha256": "b139949c5bd74937ad8ed8c8cf3d9ffb1e99c866c823204dc42c0d91fa181897",
+      "default_for": []
     }
   ]
 }

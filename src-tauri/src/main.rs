@@ -4,6 +4,7 @@ mod capture;
 mod compare;
 mod download;
 mod engine;
+mod portuguese;
 mod hw;
 mod update;
 
@@ -14,7 +15,7 @@ use overlaysubs_core::endpoint::{EndpointConfig, Endpointer, Event};
 use overlaysubs_core::browser_source;
 use overlaysubs_core::export::{self, Entry};
 use overlaysubs_core::registry::{Registry, Selection};
-use overlaysubs_core::session::{Asr, Caption, Session, SessionConfig, Translator};
+use overlaysubs_core::session::{Asr, Caption, Session, SessionConfig, Translator, DisplayMode, Stage};
 use overlaysubs_core::tier::{self, Hardware, Tier};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -67,7 +68,7 @@ impl Default for Settings {
             tier: None,
             selection: None,
             source: Source::System { device: None },
-            session: SessionConfig::default(),
+            session: SessionConfig { display_mode: DisplayMode::English, source_lang: Some("en".into()), ..SessionConfig::default() },
             asr_device: Device::Auto,
             translator_device: Device::Auto,
             whisper_gpu: None,
@@ -104,12 +105,13 @@ struct EngineConfig {
     ids: Selection,
     asr_gpu: bool,
     gpu_layers: u32,
+    original: bool,
 }
 
 struct Engines {
     cfg: EngineConfig,
     asr: engine::Whisper,
-    mt: engine::Plamo,
+    mt: Option<engine::Plamo>,
 }
 
 struct Running {
@@ -263,6 +265,18 @@ async fn check_update(app: AppHandle) -> Result<Option<update::UpdateInfo>, Stri
 
 #[tauri::command]
 fn save_settings(app: AppHandle, st: State<App>, settings: Settings) -> Result<(), String> {
+    let previous = st.settings.lock().unwrap().clone();
+    if st.running.lock().unwrap().is_some() &&
+        ((previous.session.display_mode == DisplayMode::Original) != (settings.session.display_mode == DisplayMode::Original)
+        || previous.selection != settings.selection) {
+        return Err("Pare a captura antes de trocar o modelo ou entrar/sair do modo Original.".into());
+    }
+    if matches!(settings.session.display_mode, DisplayMode::Portuguese | DisplayMode::Bilingual) {
+        let m = registry(&app)?.get(portuguese::MODEL).cloned().ok_or("Portuguese model missing from registry")?;
+        if !models_dir(&app, &settings).join(m.file).exists() {
+            return Err("Baixe o modelo Português (Brasil) na página Models primeiro.".into());
+        }
+    }
     let old = std::mem::replace(&mut *st.settings.lock().unwrap(), settings.clone());
     if old.hotkey != settings.hotkey {
         let gs = app.global_shortcut();
@@ -336,6 +350,7 @@ fn ensure_engines(app: &AppHandle, st: &App) -> Result<(), String> {
     let sel = s.selection.clone().ok_or("no models selected")?;
     let gpu = gpu_available(app);
     let cfg = EngineConfig {
+        original: s.session.display_mode == DisplayMode::Original,
         ids: sel,
         asr_gpu: s.asr_device.uses_gpu(gpu),
         // llama.cpp takes a layer count rather than a flag: all layers on the GPU, or none.
@@ -358,15 +373,18 @@ fn ensure_engines(app: &AppHandle, st: &App) -> Result<(), String> {
 /// would otherwise leave the app unable to start translating at all. Both are retried rather than
 /// the one that failed: the first engine may already hold a GPU context on the backend that just
 /// failed, and a half-GPU/half-CPU pair is harder to reason about than the documented CPU setup.
-fn load_engines(app: &AppHandle, s: &Settings, cfg: &EngineConfig) -> Result<(engine::Whisper, engine::Plamo), String> {
+fn load_engines(app: &AppHandle, s: &Settings, cfg: &EngineConfig) -> Result<(engine::Whisper, Option<engine::Plamo>), String> {
     let reg = registry(app)?;
     let dir = models_dir(app, s);
     let path = |id: &str| reg.get(id).map(|m| dir.join(&m.file)).filter(|p| p.exists()).ok_or(format!("model {id} not downloaded"));
-    let (asr, vad, mt) = (path(&cfg.ids.asr)?, path(&cfg.ids.vad)?, path(&cfg.ids.translator)?);
+    let (asr, vad) = (path(&cfg.ids.asr)?, path(&cfg.ids.vad)?);
     let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
     let load = |asr_gpu: bool, gpu_layers: u32| {
-        let asr = engine::Whisper::load(&asr, &vad, asr_gpu, threads)?;
-        let mt = engine::Plamo::load(&mt, gpu_layers, threads)?;
+        let asr = engine::Whisper::load(&asr, &vad, asr_gpu, threads.min(6))?;
+        let mt = if cfg.original {
+            if cfg.ids.translator == portuguese::MODEL { return Err("Select PLaMo for Original mode".into()); }
+            Some(engine::Plamo::load(&path(&cfg.ids.translator)?, gpu_layers, threads)?)
+        } else { None };
         Ok::<_, String>((asr, mt))
     };
     match load(cfg.asr_gpu, cfg.gpu_layers) {
@@ -407,7 +425,7 @@ async fn benchmark(app: AppHandle) -> Result<Bench, String> {
             target_lang: "ja",
             ..Default::default()
         };
-        e.mt.translate(&req, &mut |_| {})?;
+        if let Some(mt) = &mut e.mt { mt.translate(&req, &mut |_| {})?; }
         let took = t0.elapsed().as_secs_f32();
         let downgraded_to = match (tier::too_slow(took, secs), cur.lower()) {
             (true, Some(t)) => Some(Detected { hardware: hw::cached_or_detect(&config_dir(&app)), tier: t, selection: registry(&app)?.defaults(t).unwrap() }),
@@ -417,6 +435,39 @@ async fn benchmark(app: AppHandle) -> Result<Bench, String> {
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+struct SourceOnly;
+impl Translator for SourceOnly {
+    fn translate(&mut self, _: &overlaysubs_core::pfml::TranslateRequest, _: &mut dyn FnMut(&str)) -> Result<String, String> {
+        Err("No translator loaded for Original mode".into())
+    }
+}
+fn mode_is_original(cfg: &SessionConfig) -> bool { cfg.display_mode == DisplayMode::Original }
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64
+}
+fn publish_caption(app: &AppHandle, session_id: u64, c: &Caption, speech_start: u64, audio_end: u64) {
+    let st = app.state::<App>();
+    if st.session_seq.load(Ordering::SeqCst) != session_id { return; }
+    let mut value = serde_json::to_value(c).unwrap();
+    value["session_id"] = session_id.into();
+    value["speech_start_unix_ms"] = speech_start.into();
+    value["audio_end_unix_ms"] = audio_end.into();
+    value["emitted_unix_ms"] = unix_ms().into();
+    let _ = app.emit("caption", &value);
+    st.source_hub.send("caption", &value.to_string());
+}
+
+#[tauri::command]
+fn record_latency(app: AppHandle, session_id: u64, caption_id: u64, onset_ms: u64, tail_ms: u64, render_ms: u64, translated: bool) -> Result<(), String> {
+    use std::io::Write;
+    if app.state::<App>().session_seq.load(Ordering::SeqCst) != session_id { return Ok(()); }
+    let path = config_dir(&app).join("latency.jsonl");
+    // Bound the diagnostic file; never record caption text or audio.
+    if std::fs::metadata(&path).is_ok_and(|m| m.len() > 5_000_000) { let _ = std::fs::remove_file(&path); }
+    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path).map_err(|e| e.to_string())?;
+    writeln!(f, "{}", serde_json::json!({"session":session_id,"caption":caption_id,"onset_ms":onset_ms,"tail_ms":tail_ms,"render_ms":render_ms,"translated":translated})).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -430,28 +481,36 @@ fn start(app: AppHandle, st: State<App>) -> Result<(), String> {
     ensure_engines(&app, &st)?;
     let s = st.settings.lock().unwrap().clone();
     let (audio_tx, audio_rx) = mpsc::channel::<Vec<f32>>();
-    let (ev_tx, ev_rx) = mpsc::channel::<(Event, usize)>();
+    let (ev_tx, ev_rx) = mpsc::sync_channel::<(Event, usize)>(16);
     let (stop_tx, stop_rx) = mpsc::channel::<()>();
     let mut vad = engine::Silero::load(&st.engines.lock().unwrap().as_ref().unwrap().asr.vad_path)?;
+    let capture_start = unix_ms();
     let cap = capture::start(&s.source, audio_tx)?;
     let vad_app = app.clone();
     // Stream position the session has committed up to, so the endpointer drops that audio.
     let committed = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let committed_ep = committed.clone();
+    let endpoint_settings = st.settings.clone();
     std::thread::spawn(move || {
         let mut ep = Endpointer::new(EndpointConfig::default());
         let mut out = Vec::new();
         let mut pos = 0;
         for chunk in audio_rx {
             pos += chunk.len();
+            let low = endpoint_settings.lock().unwrap().session.low_latency;
+            ep.configure(if low { EndpointConfig::low_latency() } else { EndpointConfig::default() });
             ep.commit(committed_ep.load(Ordering::SeqCst));
             if let Err(err) = ep.push(&chunk, &mut vad, &mut out) {
                 let _ = vad_app.emit("error", err);
                 return;
             }
             for e in out.drain(..) {
-                if ev_tx.send((e, pos)).is_err() {
-                    return;
+                match ev_tx.try_send((e, pos)) {
+                    Ok(()) => {},
+                    Err(mpsc::TrySendError::Disconnected(_)) => return,
+                    Err(mpsc::TrySendError::Full((e, _))) => {
+                        if e.is_final() { let _ = vad_app.emit("error", "Reconhecimento sobrecarregado: segmento omitido. Use Whisper Base."); }
+                    }
                 }
             }
         }
@@ -461,20 +520,33 @@ fn start(app: AppHandle, st: State<App>) -> Result<(), String> {
     let live_settings = st.settings.clone();
     history.lock().unwrap().clear();
     let emit_app = app.clone();
-    let source_hub = st.source_hub.clone();
+
     let session_id = st.session_seq.fetch_add(1, Ordering::SeqCst) + 1;
+    let pt_path = registry(&app)?.get(portuguese::MODEL).map(|m| models_dir(&app, &s).join(&m.file)).ok_or("Portuguese model missing")?;
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let worker_app = app.clone();
+    let error_app = app.clone();
+    let (pt_tx, pt_thread) = portuguese::spawn(pt_path, cancelled.clone(), move |job| {
+        publish_caption(&worker_app, session_id, &job.caption, job.speech_start, job.audio_end);
+        let state = worker_app.state::<App>();
+        if state.session_seq.load(Ordering::SeqCst) == session_id {
+            if let Some(entry) = state.history.lock().unwrap().get_mut(job.caption.id as usize) {
+                entry.translation = job.caption.translation;
+            }
+        }
+    }, move |err| { if error_app.state::<App>().session_seq.load(Ordering::SeqCst) == session_id { let _ = error_app.emit("error", err); } });
     let session_thread = std::thread::spawn(move || {
         let mut session = Session::new(s.session);
         let mut seen = 0;
-        let mut emit = |c: Caption| {
-            let _ = emit_app.emit("caption", &c);
-            source_hub.send("caption", &serde_json::to_string(&c).unwrap());
-        };
+
         loop {
             let stopping = stop_rx.try_recv().is_ok();
             let next = if stopping { None } else { ev_rx.recv_timeout(std::time::Duration::from_millis(200)).ok() };
             let Some(first) = next else {
                 if stopping {
+                    cancelled.store(true, Ordering::Relaxed);
+                    drop(pt_tx);
+                    let _ = pt_thread.join();
                     return;
                 }
                 continue;
@@ -495,13 +567,32 @@ fn start(app: AppHandle, st: State<App>) -> Result<(), String> {
                 seen = pos;
                 let mut g = engines.lock().unwrap();
                 let Some(e) = g.as_mut() else { return };
-                let (asr, mt): (&mut dyn Asr, &mut dyn Translator) = (&mut e.asr, &mut e.mt);
-                if let Err(err) = session.handle(ev, asr, mt, &mut emit) {
+                let start = match &ev { Event::Partial { start, .. } | Event::Final { start, .. } => *start };
+                let speech_start = capture_start + (start as u64 * 1000 / 16000);
+                let audio_end = speech_start + (ev.pcm().len() as u64 * 1000 / 16000);
+                let mode = session.cfg.display_mode;
+                let mut emit = |c: Caption| {
+                    publish_caption(&emit_app, session_id, &c, speech_start, audio_end);
+                    // Translate finalized sentences only: repeated drafts consume CPU and revise translations.
+                    if c.stage == Stage::Final && matches!(mode, DisplayMode::Portuguese | DisplayMode::Bilingual) {
+                        if pt_tx.try_send(portuguese::Job { caption: c, speech_start, audio_end }).is_err() {
+                            let _ = emit_app.emit("error", "Tradutor sobrecarregado: tradução omitida para não atrasar o inglês.");
+                        }
+                    }
+                };
+                e.asr.low_latency = session.cfg.low_latency;
+                let mut no_translation = SourceOnly;
+                let mt: &mut dyn Translator = match &mut e.mt { Some(mt) => mt, None => &mut no_translation };
+                if let Err(err) = session.handle(ev, &mut e.asr, mt, &mut emit) {
                     let _ = emit_app.emit("error", err);
                 }
                 committed.store(session.committed(), Ordering::SeqCst);
             }
-            *history.lock().unwrap() = session.entries.clone();
+            let mut saved = history.lock().unwrap();
+            for (i, entry) in session.entries.iter().enumerate() {
+                if i >= saved.len() { saved.push(entry.clone()); }
+                else if mode_is_original(&session.cfg) { saved[i] = entry.clone(); }
+            }
         }
     });
     *st.running.lock().unwrap() = Some(Running { _capture: cap, stop_tx, id: session_id, session: session_thread });
@@ -996,7 +1087,7 @@ fn main() {
             }
         })
         .invoke_handler(tauri::generate_handler![
-            snapshot, save_settings, detect, download, delete_model, benchmark, start, stop, history, export_history, terms_text, accept_terms, set_click_through, reset_overlay_position, open_url, show_overlay, set_overlay_preview, check_update, startup_error
+            record_latency, snapshot, save_settings, detect, download, delete_model, benchmark, start, stop, history, export_history, terms_text, accept_terms, set_click_through, reset_overlay_position, open_url, show_overlay, set_overlay_preview, check_update, startup_error
         ])
         .build(tauri::generate_context!())
         .expect("error while building overlaysubs")

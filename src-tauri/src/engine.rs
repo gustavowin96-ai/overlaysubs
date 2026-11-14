@@ -260,7 +260,15 @@ mod tests {
         let mut asr = Whisper::load(&path("whisper-base"), &path("silero-vad-v6.2.0"), false, threads).unwrap();
         eprintln!("WHISPER threads={threads} {}", whisper_rs::print_system_info());
         let mut profiles = vec![];
-        for low in [false, true] {
+        for (low, bilingual) in [(false, false), (true, false), (true, true)] {
+            let translated = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let errors = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let results = translated.clone();
+            let failures = errors.clone();
+            let worker = bilingual.then(|| crate::portuguese::spawn(path(crate::portuguese::MODEL),
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                move |job| { results.lock().unwrap().push(job.caption); },
+                move |error| { failures.lock().unwrap().push(error); }, |_| {}));
             asr.low_latency = low;
             let mut vad = Silero::load(&asr.vad_path).unwrap();
             let audio = pcm.clone();
@@ -288,7 +296,12 @@ mod tests {
                     if !event.is_final() && i != n - 1 { continue; }
                     session.tick(pos - seen); seen = pos;
                     session.handle(event, &mut asr, &mut crate::SourceOnly, &mut |c| {
-                        captions.push(serde_json::json!({"elapsed_ms":t0.elapsed().as_millis(),"stage":c.stage,"source":c.source}));
+                        captions.push(serde_json::json!({"elapsed_ms":t0.elapsed().as_millis(),"id":c.id,"stage":c.stage,"source":c.source}));
+                        if c.stage == Stage::Final {
+                            if let Some((tx, _)) = &worker {
+                                tx.try_send(crate::portuguese::Job { caption:c, speech_start:0, audio_end:0 }).unwrap();
+                            }
+                        }
                     }).unwrap();
                 }
             }
@@ -297,14 +310,29 @@ mod tests {
             assert!(!session.entries.is_empty());
             let text = session.entries.iter().map(|e| e.source.to_lowercase()).collect::<Vec<_>>().join(" ");
             assert!(text.contains("country"), "Unexpected ASR: {text}");
-            eprintln!("REPLAY low_latency={low} first_caption={:?} elapsed={:?}", captions.first(), t0.elapsed());
-            profiles.push(serde_json::json!({"low_latency":low,"captions":captions}));
+            let cer = overlaysubs_core::metrics::cer("And so my fellow Americans ask not what your country can do for you ask what you can do for your country", &text);
+            eprintln!("REPLAY low_latency={low} bilingual={bilingual} CER={cer:.3} first_caption={:?} elapsed={:?}", captions.first(), t0.elapsed());
+            if let Some((tx, handle)) = worker { drop(tx); handle.join().unwrap(); }
+            let failures = errors.lock().unwrap();
+            assert!(failures.is_empty(), "Translation worker errors: {failures:?}");
+            let translated = translated.lock().unwrap();
+            if bilingual {
+                assert_eq!(translated.len(), session.entries.len());
+                for c in translated.iter() {
+                    assert_eq!(c.source, session.entries[c.id as usize].source);
+                    assert!(!c.translation.trim().is_empty());
+                }
+            }
+            profiles.push(serde_json::json!({"low_latency":low,"bilingual":bilingual,"captions":captions,"completed_ms":t0.elapsed().as_millis(),"character_error_rate":cer,"translations":*translated}));
         }
         let report = serde_json::json!({"translations":translations,"replays":profiles,"note":"CPU capture replay to recognition, not physical speech to overlay paint; record the host separately"});
         std::fs::write("../ptbr-smoke.json", serde_json::to_string_pretty(&report).unwrap()).unwrap();
         let normal = report["replays"][0]["captions"][0]["elapsed_ms"].as_u64().unwrap();
         let low = report["replays"][1]["captions"][0]["elapsed_ms"].as_u64().unwrap();
         assert!(low < normal && low < 5000, "Low Latency regression: first caption normal={normal}ms low={low}ms");
+        for profile in report["replays"].as_array().unwrap() {
+            assert!(profile["character_error_rate"].as_f64().unwrap() < 0.15, "Recognition quality regression: {profile}");
+        }
     }
 
     /// A 16 kHz mono s16 WAV.

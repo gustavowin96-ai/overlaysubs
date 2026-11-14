@@ -40,10 +40,17 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force src-tauri/libs | Out-Null
           New-Item -ItemType File -Force src-tauri/libs/placeholder.dll | Out-Null
-          cargo build --release -p overlaysubs
+          $buildEvents = cargo build --release -p overlaysubs --message-format=json
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Remove-Item -LiteralPath src-tauri/libs/placeholder.dll
-          Copy-Item C:\t\release\build\llama-cpp-sys-2-*\out\bin\*.dll src-tauri/libs/
+          $native = @($buildEvents | ForEach-Object { $_ | ConvertFrom-Json } | Where-Object { $_.reason -eq 'build-script-executed' -and $_.package_id -like '*llama-cpp-sys-2*' })
+          if ($native.Count -ne 1) { throw 'Expected one llama native build directory' }
+          $dlls = @(Get-ChildItem -LiteralPath $native[0].out_dir -Recurse -Filter *.dll)
+          foreach ($group in ($dlls | Group-Object Name)) {
+            $hashes = @($group.Group | Get-FileHash -Algorithm SHA256 | Select-Object -ExpandProperty Hash -Unique)
+            if ($hashes.Count -ne 1) { throw "Conflicting native DLLs: $($group.Name)" }
+            Copy-Item -LiteralPath $group.Group[0].FullName -Destination src-tauri/libs/
+          }
           if (!(Test-Path src-tauri/libs/llama.dll)) { throw 'llama.dll missing' }
           (Resolve-Path src-tauri/libs).Path >> $env:GITHUB_PATH
       - name: Application tests

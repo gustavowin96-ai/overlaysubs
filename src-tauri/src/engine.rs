@@ -23,6 +23,7 @@ impl Whisper {
     pub fn load(model: &Path, vad: &Path, use_gpu: bool, threads: usize) -> Result<Self, String> {
         let mut p = WhisperContextParameters::default();
         p.use_gpu(use_gpu);
+        p.flash_attn(true);
         let ctx = WhisperContext::new_with_params(model, p).map_err(|e| e.to_string())?;
         Ok(Self { ctx, low_latency: false, vad_path: vad.to_string_lossy().into_owned(), threads: threads.min(8) as i32 })
     }
@@ -47,6 +48,13 @@ impl Asr for Whisper {
         p.set_n_threads(self.threads);
         p.set_language(Some(lang.unwrap_or("auto")));
         p.set_no_context(true);
+        if self.low_latency {
+            // Whisper otherwise encodes a full 30-second window for every short draft.
+            // One encoder position is 320 samples (20 ms); retain padding and align
+            // the short context while never exceeding the model's positional table.
+            let positions = (pcm.len().div_ceil(320) + 16).div_ceil(128) * 128;
+            p.set_audio_ctx(positions.clamp(128, self.ctx.n_audio_ctx() as usize) as i32);
+        }
         // The prompt comes from user settings; set_initial_prompt panics on NUL.
         let prompt = prompt.replace('\0', "");
         if !prompt.is_empty() {
@@ -250,6 +258,7 @@ mod tests {
         let pcm = wav(dir.join("jfk.wav"));
         let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(6);
         let mut asr = Whisper::load(&path("whisper-base"), &path("silero-vad-v6.2.0"), false, threads).unwrap();
+        eprintln!("WHISPER threads={threads} {}", whisper_rs::print_system_info());
         let mut profiles = vec![];
         for low in [false, true] {
             asr.low_latency = low;
@@ -293,6 +302,9 @@ mod tests {
         }
         let report = serde_json::json!({"translations":translations,"replays":profiles,"note":"CPU capture replay to recognition, not physical speech to overlay paint; record the host separately"});
         std::fs::write("../ptbr-smoke.json", serde_json::to_string_pretty(&report).unwrap()).unwrap();
+        let normal = report["replays"][0]["captions"][0]["elapsed_ms"].as_u64().unwrap();
+        let low = report["replays"][1]["captions"][0]["elapsed_ms"].as_u64().unwrap();
+        assert!(low < normal && low < 5000, "Low Latency regression: first caption normal={normal}ms low={low}ms");
     }
 
     /// A 16 kHz mono s16 WAV.
